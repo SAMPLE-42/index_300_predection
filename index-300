@@ -1,0 +1,310 @@
+# 导入必要的包
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import talib as ta
+from sklearn.decomposition import PCA
+from jqdatasdk import *
+
+# 基于pytorch框架进行LSTM预测
+import torch
+from torch import nn
+from torch.autograd import Variable
+
+# 数据可以通过访问聚宽API获取
+auth('用户名', '密码')
+
+# 读取数据
+df_future = pd.read_excel("D:\Xunlei Download\current.xls")
+df_future_2 = pd.read_excel("D:\Xunlei Download\\next_2.xls")
+df_future_3 = pd.read_excel("D:\Xunlei Download\\nest_3.xls")
+df_future_4 = pd.read_excel("D:\Xunlei Download\\next_4.xls")
+df_future_4
+
+
+
+# 利用talib库，基于上述计算技术指标
+# 移动平均
+df_future['ma_5'] = ta.SMA(df_future['close'], timeperiod=5)
+df_future['ma_10'] = ta.SMA(df_future['close'], timeperiod=15)
+
+# 相对强弱指标
+df_future['RSI_6'] = ta.RSI(df_future['close'], timeperiod=6)
+df_future['RSI_12'] = ta.RSI(df_future['close'], timeperiod=12)
+
+# 随机指标 KDJ
+# KDJ指标并不用于分析趋势的运行状态,而主要用于分析市场短期内的超买超卖情况,从而指导投资者进行短线的高抛低吸操作
+df_k , df_d = ta.STOCH(df_future['high'], df_future['low'], df_future['close'],slowk_period=3, slowk_matype=0, slowd_period=3, slowd_matype=0)
+df_j = df_k * 3 - df_d * 2
+df_future['K'] = df_k
+df_future['D'] = df_d
+df_future['J'] = df_j
+
+# 动量指标
+df_future['MOM'] = ta.MOM(df_future['close'], timeperiod=10)
+
+# 平均趋向指数
+df_future['ADX'] = ta.ADX(df_future['high'], df_future['low'], df_future['close'], timeperiod=14)
+
+# 步林带BBANDS
+df_future['u_band'], df_future['m_band'], df_future['l_band'] = ta.BBANDS(df_future['close'], timeperiod=5, nbdevup=2, nbdevdn=2, matype=0)
+
+# AD线随机指标
+df_future['AD'] = ta.AD(df_future['high'], df_future['low'], df_future['close'], df_future['volumn'])
+
+# ADOSC 佳庆指标
+df_future['ADOSC'] = ta.ADOSC(df_future['high'], df_future['low'], df_future['close'], df_future['volumn'], fastperiod=3, slowperiod=10)
+
+# OBV 能量潮
+df_future['OBV'] = ta.OBV(df_future['close'], df_future['volumn'])
+
+# 威廉指标
+df_future['WILLR'] = ta.WILLR(df_future['high'], df_future['low'], df_future['close'], timeperiod=14)
+
+# 离乖率 BIAS=(当日指数或收盘价-N日平均指数或收盘价)÷N日平均指数或收盘价×100％
+# N的参数一般确定为6日、12日、24日，并且同时设置成三条线
+def get_BIAS(close, timeperiod):
+    """
+        离乖率计算
+    """
+    if isinstance(close,np.ndarray):
+        pass
+    else: close = np.array(close)
+    MA = ta.MA(close,timeperiod=timeperiod)
+    return (close-MA)/MA
+
+df_future['BIAS_6'] = get_BIAS(df_future['close'], timeperiod=6)
+df_future['BIAS_12'] = get_BIAS(df_future['close'], timeperiod=12)
+df_future['BIAS_24'] = get_BIAS(df_future['close'], timeperiod=24)
+
+
+# 预处理（删除缺失值， 归一化处理， 降维）
+df_future.dropna(inplace=True)
+df_future
+
+# 归一化（实际上，lsrm对输入数据的量纲没有被过多要求，这边更多的是提高收敛速度）
+# 归一化的方式一般也可以用z-scores
+# 也可以使用statamodels库的Minmaxium（）
+df_scaled = (df_future - df_future.min()) / (df_future.max() - df_future.min())
+df_scaled
+
+# 主成分分析,（PCA本质是对方差进行SVD）
+pca = PCA()     # 实例化
+pca.fit(df_scaled)
+print(pca.components_)     # 输出特征向量
+explained_var = pca.explained_variance_ratio_ # 获取贡献率
+print(explained_var)
+
+# 根据上述的贡献率，选取前7个变量作为主成分
+pca = PCA(7)
+pca.fit(df_scaled)
+low_dim = pca.transform(df_scaled)
+print(pca.components_)
+print(pca.explained_variance_ratio_)
+
+
+# 将上述的主成分和现货的收盘价拼成一个DataFrame
+scaled = np.column_stack((low_dim, df_index['close']))
+scaled = pd.DataFrame(scaled)
+scaled
+
+
+
+# 将时间序列问题转化为监督学习问题
+def series_to_supervised(data, n_in=1, n_out=1, dropnan=True):
+    """
+        data: 观测序列。格式是一个 list 或 2维 Numpy Array   required
+        n_in: 观测数据input(X)的步长，范围[1, len(data)], 默认为1
+        n_out: 观测数据output(y)的步长， 范围为[0, len(data)-1], 默认为1
+        dropnan: 是否删除存在NaN的行，默认为True
+    """
+    n_vars = 1 if type(data) is list else data.shape[1]
+    df = pd.DataFrame(data)
+    # cols 用以存储滞后数据
+    # names 存储的是对应滞后数据的列名(即滞后的阶数)
+    cols, names = [], []
+    # i: n_in, n_in-1, ..., 1
+    # 即输入序列(t-n, t-n-1, ... , t-1)
+    # range(start, end, step)
+    for i in range(n_in, 0, -1):
+        # 将滞后数据添入clos的空列表中
+        cols.append(df.shift(i))
+        # var2(t-1)表示第二个特征的滞后一阶的数据
+        names += [('(var%d(t-%d))' % (j+1, i)) for j in range(n_vars)]
+
+    # 预测序列(t, t+1, t+2, ...)
+    for i in range(0, n_out):
+        # df向下平移， 空出的位置则是需要预测的位置
+        cols.append(df.shift(-i))
+        # 对i而言，滞后几阶，就预测几阶
+        if i == 0:
+            names += [('(var%d(t))' % (j+1)) for j in range(n_vars)]
+        else:
+            names +=[('var%d(t+%d)' % (j +1, i)) for j in range(n_vars)]
+    # 将滞后和预测拼在一起
+    agg = pd.concat(cols, axis=1)
+    agg.columns = names
+    # 删除nan值
+    if dropnan:
+        agg.dropan(inplace=True)
+    return agg
+    
+   
+# 利用series_to_supervised（）将数据转化为lstm能够处理的形式
+# 利用滞后3期的数据预测
+df_lstm = series_to_supervised(scaled, 3, 2, dropnan=False)
+df_lstm.set_index(df_scaled.index, inplace=True)
+df_lstm.dropna(inplace=True)
+df_lstm
+
+
+# 切分数据,80%作为训练集， 20%作为预测集
+sample_num = scaled.shape[0]
+train_num = int(scaled.shape[0] * 0.8)
+test_num = scaled.shape[0] - train_num
+sample_num, train_num, test_num
+
+df_lstm = pd.DataFrame(low_dim)
+train_X = df_lstm.iloc[:train_num, :]
+test_X = df_lstm.iloc[train_num:, :]
+print(train_X.shape, test_X.shape)
+
+train_y = np.array(df_scaled['close'].iloc[:train_num])
+test_y = np.array(df_scaled['close'].iloc[train_num:])
+print(train_y.shape, test_y.shape)
+
+
+# 利用pytorch框架搭建lstm网络
+# 搭建网络
+class LstmRNN(nn.Module):
+    """
+        Parameters：
+        - input_size: feature size
+        - hidden_size: number of hidden units
+        - output_size: number of output
+        - num_layers: layers of LSTM to stack
+    """
+
+    def __init__(self, input_size, hidden_size=1, output_size=1, num_layers=1):
+        super().__init__()
+
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers)  # utilize the LSTM model in torch.nn
+        self.linear1 = nn.Linear(hidden_size, output_size) # 全连接层
+
+    def forward(self, _x):
+        x, _ = self.lstm(_x)  # _x is input, size (seq_len, batch, input_size)
+        s, b, h = x.shape  # x is output, size (seq_len, batch, hidden_size)
+        x = x.view(s * b, h)
+        x = self.linear1(x)
+        x = x.view(s, b, -1)
+        return x
+        
+        
+        
+if __name__ == '__main__':
+
+# 判断电脑GPU是否可用，不可以则在cpu环境训练
+
+    device = torch.device("cpu")
+
+    if (torch.cuda.is_available()):
+        device = torch.device("cuda:0")
+        print('Training on GPU.')
+    else:
+        print('No GPU available, training on CPU.')
+
+# 将切分的数据转化为浮点数，以便随后调用
+    train_X = np.array(train_X).astype('float32')
+    test_X = np.array(test_X).astype('float32')
+    data_train_y = np.array(train_y).astype('float32')
+    data_test_y = np.array(test_y).astype('float32')
+
+# 定义输入的特征维度和输出维度
+    input_features_num = train_X.shape[1]
+    output_features_num = 1
+    
+# reshape(),转换矩阵
+    train_x_tensor = train_X.reshape(-1, 1, input_features_num)
+    train_y_tensor = data_train_y.reshape(-1, 1, output_features_num)
+
+# 转换成张量
+    train_x_tensor = torch.from_numpy(train_x_tensor)
+    train_y_tensor = torch.from_numpy(train_y_tensor)
+
+
+    lstm_model = LstmRNN(input_features_num, 32, output_size=output_features_num, num_layers=1).to(device)  # 32 hidden units
+    print('LSTM model:', lstm_model)
+    print('model.parameters:', lstm_model.parameters)
+    print('train x tensor dimension:', Variable(train_x_tensor).size())
+
+    criterion = nn.MSELoss()    # 损失函数为均方误差
+    optimizer = torch.optim.Adam(lstm_model.parameters(), lr=1e-2)      # 优化器 Adma
+
+    prev_loss = 20
+    max_epochs = 50
+
+# 将数据送往GPU
+    train_x_tensor = train_x_tensor.to(device)
+    train_y_tensor = train_y_tensor.to(device)
+
+
+    for epoch in range(max_epochs):
+        output = lstm_model(train_x_tensor).to(device)
+        loss = criterion(output, train_y_tensor)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        if loss < prev_loss:
+            torch.save(lstm_model.state_dict(), 'lstm_model.pt')  # save model parameters to files
+            prev_loss = loss
+
+        if loss.item() < 1e-4:
+            print('Epoch [{}/{}], Loss: {:.5f}'.format(epoch + 1, max_epochs, loss.item()))
+            print("The loss value is reached")
+            break
+        elif (epoch + 1) % 100 == 0:
+            print('Epoch: [{}/{}], Loss:{:.5f}'.format(epoch + 1, max_epochs, loss.item()))
+
+    # prediction on training dataset
+    pred_y_for_train = lstm_model(train_x_tensor).to(device)
+    pred_y_for_train = pred_y_for_train.view(-1, output_features_num).cpu().data.numpy()
+
+    # ----------------- test -------------------
+    lstm_model = lstm_model.eval()  # switch to testing model
+
+    # prediction on test dataset
+    test_x_tensor = test_X.reshape(-1, 1,
+                                   input_features_num)
+    test_x_tensor = torch.from_numpy(test_x_tensor)  # 变为tensor
+    test_x_tensor = test_x_tensor.to(device)
+
+    pred_y_for_test = lstm_model(test_x_tensor).to(device)
+    pred_y_for_test = pred_y_for_test.view(-1, output_features_num).cpu().data.numpy()
+
+# criterion的使用直接使用张量会报错，要先把数据送回cpu即pred_y_for_test.view(-1, output_features_num).cpu().data.numpy()
+    loss = criterion(torch.from_numpy(pred_y_for_test), torch.from_numpy(data_test_y))
+    print("test loss：", loss.item())
+
+    fig = plt.figure(figsize=(10, 6))
+
+    # 可视化
+    ax1 = fig.add_subplot(111)
+    ax1.plot(pred_y_for_train, '-', color='b', label='pred_train')
+    ax1.plot(train_y, '-',color='r', label='real_train')
+    ax1.set_ylabel('close_price')
+    ax1.legend(loc=2)
+
+
+    plt.show()
+    
+    pred_y_for_test = pd.DataFrame(pred_y_for_test)
+    test_y = pd.DataFrame(test_y)
+    fig = plt.figure(figsize=(10, 6))
+    ax = fig.subplots()
+    ax.plot(pred_y_for_test, '-', color='b', label='pred_test')
+    ax.plot(test_y, '-',color='r', label='real')
+    ax.set_ylabel('close_price')
+    ax.legend(loc=2)
+    plt.show()
